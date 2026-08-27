@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 use bb_cli::commands;
-use bb_cli::error::Result;
-use bb_cli::output::Format;
-use clap::{Parser, Subcommand};
+use bb_cli::error::{BbError, Result};
+use bb_cli::output::{self, Format};
+use bb_cli::skill;
+use bb_cli::workspace;
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +44,16 @@ enum Command {
         #[command(subcommand)]
         command: BranchCommand,
     },
+    /// Work with bitbucket projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+    /// Work with repositories
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
     /// Open the repository in a browser
     #[command(alias = "b")]
     Browse {
@@ -62,6 +74,47 @@ enum Command {
     },
     /// Check for a newer release and update this install
     Update,
+    /// Install the bundled agent skill so your coding agent can drive `bb`
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Install or refresh the skill for the agents in this project
+    Install {
+        /// Which agent layout to write: agents, claude or all (default: auto-detect)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Install into your home directory instead of this project
+        #[arg(long)]
+        global: bool,
+        /// Overwrite a skill file that was edited locally
+        #[arg(long)]
+        force: bool,
+        /// Only act on this skill; omit for all of them
+        #[arg(long)]
+        skill: Option<String>,
+        /// Install every skill without asking
+        #[arg(long, conflicts_with = "skill")]
+        all: bool,
+    },
+    /// Show where the skill is installed and whether it is current
+    Status,
+    /// Remove skills this tool installed
+    Uninstall {
+        /// Act on your home directory instead of this project
+        #[arg(long)]
+        global: bool,
+        /// Remove a skill file that was edited locally
+        #[arg(long)]
+        force: bool,
+        /// Only act on this skill; omit for all of them
+        #[arg(long)]
+        skill: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -78,6 +131,60 @@ enum BranchCommand {
         /// Maximum rows to print
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// List the projects in a workspace
+    #[command(alias = "l", alias = "ls")]
+    List {
+        /// Only projects whose key or name matches this substring
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+        /// Maximum rows to print
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Workspace to act on; defaults to BB_WORKSPACE, then the git remote
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Create a repository in a project
+    Create {
+        /// Repository name, used as the slug
+        name: String,
+        /// Project to create it in, by key; prompts when omitted in a terminal
+        #[arg(long)]
+        project: Option<String>,
+        /// One-line description
+        #[arg(long)]
+        description: Option<String>,
+        /// Create a public repository; private is the default
+        #[arg(long)]
+        public: bool,
+        /// Workspace to act on; defaults to BB_WORKSPACE, then the git remote
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// List the repositories in a workspace
+    #[command(alias = "l", alias = "ls")]
+    List {
+        /// Only repositories in this project, by key
+        #[arg(long)]
+        project: Option<String>,
+        /// Only repositories whose name matches this substring
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+        /// Maximum rows to print
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Workspace to act on; defaults to BB_WORKSPACE, then the git remote
+        #[arg(long)]
+        workspace: Option<String>,
     },
 }
 
@@ -103,6 +210,12 @@ enum PrCommand {
         /// Only pull requests waiting on your review
         #[arg(long)]
         needs_my_review: bool,
+        /// Show the build status column (one extra request per pull request)
+        #[arg(long)]
+        build: bool,
+        /// Only pull requests whose build rolls up to this state
+        #[arg(long, value_enum)]
+        build_status: Option<commands::pr_list::BuildStateArg>,
     },
     /// Print the raw diff for a pull request
     #[command(alias = "d")]
@@ -112,12 +225,24 @@ enum PrCommand {
     /// List commits in a pull request
     #[command(alias = "c")]
     Commits { id: u64 },
-    /// Request changes on a pull request
+    /// Show the build statuses reported on a pull request
+    Build { id: u64 },
+    /// Request changes on a pull request, after confirming
     #[command(name = "request-changes", alias = "rc")]
-    RequestChanges { id: u64 },
-    /// Withdraw a change request
+    RequestChanges {
+        id: u64,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Withdraw a change request, after confirming
     #[command(name = "no-request-changes", alias = "nrc")]
-    NoRequestChanges { id: u64 },
+    NoRequestChanges {
+        id: u64,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Open a pull request
     Create {
         /// Target branch, or a comma-separated list of target branches
@@ -197,6 +322,25 @@ enum PrCommand {
         /// Id of the thread's first comment
         comment: u64,
     },
+    /// List your pull requests across every repository you can see
+    Mine {
+        /// Which pull requests: author, reviewer or all
+        #[arg(long, value_enum, default_value = "all")]
+        role: commands::pr_mine::RoleArg,
+        /// State filter: OPEN, MERGED, DECLINED, SUPERSEDED or ALL
+        #[arg(long, default_value = "OPEN")]
+        state: String,
+        /// Workspace(s) to scan, comma-separated. Falls back to BB_WORKSPACE,
+        /// then to the workspace of the current git checkout.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Most recently updated repositories to scan per workspace
+        #[arg(long, default_value_t = 30)]
+        repo_limit: usize,
+        /// Show the build status column (one extra request per pull request)
+        #[arg(long)]
+        build: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -222,6 +366,18 @@ enum ReviewersCommand {
 #[derive(Subcommand)]
 enum AuthCommand {
     /// Store an atlassian api token in the os keyring
+    #[command(long_about = "Store an atlassian api token in the os keyring.
+
+Create the token at https://id.atlassian.com/manage-profile/security/api-tokens,
+choosing \"Create API token with scopes\" and Bitbucket as the product, then grant:
+
+  read:user:bitbucket          required — login verifies the token against /user
+  read:pullrequest:bitbucket   pr list, view, diff, files, commits, mine
+  read:repository:bitbucket    branch list, default reviewers, the pr mine scan
+  write:pullrequest:bitbucket  pr create, comment, resolve, request-changes
+
+The write scope is only needed to create pull requests and comment; everything
+read-only works with the first three.")]
     Login {
         /// Atlassian account email
         #[arg(long)]
@@ -236,8 +392,94 @@ enum AuthCommand {
     Logout,
 }
 
+/// `brew upgrade bb` and `cargo install` replace the binary without running any
+/// of our code, so an installed skill file would otherwise keep describing an
+/// older CLI until someone noticed `bb skill status` saying `stale` and re-ran
+/// the install. Every tracked entry records the version that wrote it, so the
+/// check is a string compare and costs nothing once everything is current.
+///
+/// Five properties this keeps, each with a test: it never overwrites a locally
+/// edited file (`refresh_tracked` reports those as skipped), it never writes to
+/// stdout so `--json` stays pure, it never fails the command the user actually
+/// asked for, `BB_SKILL_NO_AUTO_REFRESH=1` turns it off, and `refresh_tracked`
+/// stamps the running version onto every entry it looked at — including skipped
+/// ones — so this fires once per upgrade rather than on every invocation.
+fn auto_refresh_skills(format: Format) {
+    if std::env::var_os("BB_SKILL_NO_AUTO_REFRESH").is_some() {
+        return;
+    }
+    let (entries, _warning) = skill::load_state();
+    if entries.is_empty() || !skill::tracked_version_differs(&entries) {
+        return;
+    }
+    // `Preserve` because this call runs ahead of a command the user did not
+    // ask to refresh anything with — a file they deliberately deleted must
+    // stay deleted here. Only explicit `bb skill install`/`bb update` restore
+    // a missing file.
+    match skill::refresh_tracked(skill::MissingPolicy::Preserve) {
+        Ok(outcomes) => {
+            // Refreshed, pruned and failed are different events and the line
+            // must not conflate them: "refreshed 2" when some were actually
+            // dropped or left broken reads as a write that never happened.
+            let refreshed = outcomes
+                .iter()
+                .filter(|o| o.action == skill::Action::Refreshed)
+                .count();
+            let pruned = outcomes
+                .iter()
+                .filter(|o| o.action == skill::Action::Pruned)
+                .count();
+            let failed = outcomes
+                .iter()
+                .filter(|o| o.action == skill::Action::Failed)
+                .count();
+            if (refreshed > 0 || pruned > 0 || failed > 0) && !format.is_json() {
+                let mut parts = Vec::new();
+                if refreshed > 0 {
+                    parts.push(format!(
+                        "refreshed {refreshed} skill file{}",
+                        if refreshed == 1 { "" } else { "s" }
+                    ));
+                }
+                if pruned > 0 {
+                    parts.push(format!(
+                        "forgot {pruned} skill path{} that no longer exist{}",
+                        if pruned == 1 { "" } else { "s" },
+                        if pruned == 1 { "s" } else { "" }
+                    ));
+                }
+                // Named once, as a count — not per path — so a read-only
+                // checkout does not spam a line per tracked entry on every
+                // single invocation.
+                if failed > 0 {
+                    parts.push(format!(
+                        "could not refresh {failed} skill file{}",
+                        if failed == 1 { "" } else { "s" }
+                    ));
+                }
+                output::warn(&format!(
+                    "{} for bb {}",
+                    parts.join(", "),
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
+        }
+        // The user asked for something else. A read-only filesystem or a
+        // vanished directory must not turn their command into a failure. Per
+        // entry write failures no longer reach here at all (see
+        // `refresh_tracked`'s `Action::Failed`) — only `save_state` itself
+        // failing does, which is rare enough that warning every time is fine.
+        Err(err) => {
+            if !format.is_json() {
+                output::warn(&format!("could not refresh agent skills: {err}"));
+            }
+        }
+    }
+}
+
 async fn run(cli: Cli) -> Result<()> {
     let format = Format::from_json_flag(cli.json);
+    auto_refresh_skills(format);
     match cli.command {
         Command::Auth { command } => match command {
             AuthCommand::Login { email, token_stdin } => {
@@ -247,6 +489,26 @@ async fn run(cli: Cli) -> Result<()> {
             AuthCommand::Logout => commands::auth::logout(format),
         },
         Command::Pr { command } => {
+            if let PrCommand::Mine {
+                role,
+                state,
+                workspace,
+                repo_limit,
+                build,
+            } = command
+            {
+                return commands::pr_mine::run(
+                    format,
+                    commands::pr_mine::MineArgs {
+                        role,
+                        state,
+                        workspace,
+                        repo_limit,
+                        build,
+                    },
+                )
+                .await;
+            }
             let ctx = commands::pr::Ctx::new(cli.repo.as_deref(), format)?;
             match command {
                 PrCommand::List {
@@ -256,6 +518,8 @@ async fn run(cli: Cli) -> Result<()> {
                     author,
                     review_state,
                     needs_my_review,
+                    build,
+                    build_status,
                 } => {
                     commands::pr_list::list(
                         &ctx,
@@ -266,6 +530,8 @@ async fn run(cli: Cli) -> Result<()> {
                             author,
                             review_state,
                             needs_my_review,
+                            build,
+                            build_status,
                         },
                     )
                     .await
@@ -273,9 +539,12 @@ async fn run(cli: Cli) -> Result<()> {
                 PrCommand::Diff { id } => commands::pr::diff(&ctx, id).await,
                 PrCommand::Files { id } => commands::pr::files(&ctx, id).await,
                 PrCommand::Commits { id } => commands::pr::commits(&ctx, id).await,
-                PrCommand::RequestChanges { id } => commands::pr::request_changes(&ctx, id).await,
-                PrCommand::NoRequestChanges { id } => {
-                    commands::pr::unrequest_changes(&ctx, id).await
+                PrCommand::Build { id } => commands::pr_build::run(&ctx, id).await,
+                PrCommand::RequestChanges { id, yes } => {
+                    commands::pr::request_changes(&ctx, id, yes).await
+                }
+                PrCommand::NoRequestChanges { id, yes } => {
+                    commands::pr::unrequest_changes(&ctx, id, yes).await
                 }
                 PrCommand::Create {
                     target,
@@ -351,6 +620,9 @@ async fn run(cli: Cli) -> Result<()> {
                 PrCommand::Unresolve { id, comment } => {
                     commands::pr_comments::unresolve(&ctx, id, comment).await
                 }
+                PrCommand::Mine { .. } => {
+                    Err(BbError::Config("pr mine does not take a repository".into()))
+                }
             }
         }
         Command::Branch { command } => {
@@ -361,6 +633,37 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Project { command } => match command {
+            ProjectCommand::List {
+                name,
+                limit,
+                workspace,
+            } => {
+                let ctx = workspace::WorkspaceCtx::new(workspace.as_deref(), format)?;
+                commands::project::list(&ctx, name, limit).await
+            }
+        },
+        Command::Repo { command } => match command {
+            RepoCommand::Create {
+                name,
+                project,
+                description,
+                public,
+                workspace,
+            } => {
+                let ctx = workspace::WorkspaceCtx::new(workspace.as_deref(), format)?;
+                commands::repo::create(&ctx, name, project, description, public).await
+            }
+            RepoCommand::List {
+                project,
+                name,
+                limit,
+                workspace,
+            } => {
+                let ctx = workspace::WorkspaceCtx::new(workspace.as_deref(), format)?;
+                commands::repo::list(&ctx, project, name, limit).await
+            }
+        },
         Command::Browse {
             print,
             pr,
@@ -382,12 +685,49 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Update => {
             commands::update::run(format, &commands::update::release_api_base()).await
         }
+        Command::Skill { command } => match command {
+            SkillCommand::Install {
+                agent,
+                global,
+                force,
+                skill,
+                all,
+            } => commands::skill::install(
+                format,
+                agent.as_deref(),
+                global,
+                force,
+                skill.as_deref(),
+                all,
+            ),
+            SkillCommand::Status => commands::skill::status(format),
+            SkillCommand::Uninstall {
+                global,
+                force,
+                skill,
+            } => commands::skill::uninstall(format, global, force, skill.as_deref()),
+        },
     }
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    // `clap`'s `conflicts_with` cannot span a global, top-level arg and an id
+    // that only exists on one nested subcommand's own `Command` node, so this
+    // is enforced by hand instead, using clap's own error rendering — `pr
+    // mine` is not repository-scoped, and accepting `-R`/`--repo` there would
+    // silently discard it (see `PrCommand::Mine { .. }`'s residual match arm).
+    if cli.repo.is_some()
+        && matches!(&cli.command, Command::Pr { command } if matches!(command, PrCommand::Mine { .. }))
+    {
+        let mut cmd = Cli::command();
+        cmd.error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "the argument '--repo' cannot be used with 'pr mine': it scans every repository, not one",
+        )
+        .exit();
+    }
     if let Err(err) = run(cli).await {
         eprintln!("error: {err}");
         std::process::exit(err.exit_code());

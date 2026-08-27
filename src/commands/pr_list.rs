@@ -1,5 +1,6 @@
-use crate::api::models::{PullRequest, ReviewState, ReviewerState};
+use crate::api::models::{BuildState, BuildStatus, PullRequest, ReviewState, ReviewerState};
 use crate::commands::pr::Ctx;
+use crate::commands::pr_build;
 use crate::error::Result;
 use crate::output::{self, Format};
 use crate::users::{current_user, resolve_user};
@@ -22,6 +23,28 @@ impl ReviewStateArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BuildStateArg {
+    Successful,
+    Failed,
+    Inprogress,
+    Stopped,
+    /// No check ever reported on the pull request.
+    None,
+}
+
+impl BuildStateArg {
+    fn as_state(self) -> BuildState {
+        match self {
+            Self::Successful => BuildState::Successful,
+            Self::Failed => BuildState::Failed,
+            Self::Inprogress => BuildState::InProgress,
+            Self::Stopped => BuildState::Stopped,
+            Self::None => BuildState::None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ListArgs {
     pub destination: Option<String>,
@@ -30,6 +53,9 @@ pub struct ListArgs {
     pub author: Option<String>,
     pub review_state: Option<ReviewStateArg>,
     pub needs_my_review: bool,
+    /// Show the build column. Costs one extra request per pull request.
+    pub build: bool,
+    pub build_status: Option<BuildStateArg>,
 }
 
 /// Bitbucket's paginated pull-request endpoint returns a reduced object that omits
@@ -39,7 +65,8 @@ pub struct ListArgs {
 /// The `+` must arrive url-encoded as `%2B`: a bare `+` in a query string decodes
 /// as a space and bitbucket then ignores the whole parameter, which is exactly the
 /// silent failure this feature exists to fix.
-const REVIEWER_FIELDS: &str = "%2Bvalues.reviewers,%2Bvalues.participants,%2Bvalues.draft";
+pub(crate) const REVIEWER_FIELDS: &str =
+    "%2Bvalues.reviewers,%2Bvalues.participants,%2Bvalues.draft";
 
 const ALL_STATES: &str = "OPEN,MERGED,DECLINED,SUPERSEDED";
 
@@ -60,6 +87,12 @@ struct PrRow {
     destination: String,
     reviewers: Vec<ReviewerState>,
     url: String,
+    /// Absent unless the build column was asked for, so today's `--json` shape
+    /// is unchanged for existing callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_state: Option<BuildState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build: Option<Vec<BuildStatus>>,
 }
 
 fn to_row(pr: &PullRequest) -> PrRow {
@@ -74,6 +107,8 @@ fn to_row(pr: &PullRequest) -> PrRow {
         destination: pr.destination_branch().to_string(),
         reviewers: pr.reviewer_states(),
         url: pr.html_url().to_string(),
+        build_state: None,
+        build: None,
     }
 }
 
@@ -87,7 +122,11 @@ fn reviewer_cell(reviewers: &[ReviewerState]) -> String {
 
 /// `all` and `draft` are bb-level conveniences, not bitbucket states. `draft` is a
 /// boolean on an OPEN pull request, so it asks for OPEN and filters afterwards.
-fn state_query(state: &str) -> String {
+///
+/// Shared with `pr_mine`, which has no `draft` boolean to filter on afterwards
+/// (a cross-workspace pull request result carries the same fields either way) —
+/// `pr mine` rejects `--state draft` before this is ever called with it.
+pub(crate) fn state_query(state: &str) -> String {
     if state.eq_ignore_ascii_case("all") {
         ALL_STATES.to_string()
     } else if state.eq_ignore_ascii_case("draft") {
@@ -147,7 +186,7 @@ pub async fn list(ctx: &Ctx, args: ListArgs) -> Result<()> {
         .await?;
     spinner.finish_and_clear();
 
-    let rows: Vec<PrRow> = prs
+    let kept: Vec<&PullRequest> = prs
         .iter()
         .filter(|pr| match args.destination.as_deref() {
             Some(branch) => pr.destination_branch() == branch,
@@ -179,41 +218,68 @@ pub async fn list(ctx: &Ctx, args: ListArgs) -> Result<()> {
                 Some(ReviewState::ChangesRequested) | Some(ReviewState::Pending)
             )
         })
-        .map(to_row)
         .collect();
 
-    render(ctx, &rows)
+    let mut rows: Vec<PrRow> = kept.iter().map(|pr| to_row(pr)).collect();
+
+    // Build status is a per-pull-request endpoint, so this is the one place the
+    // command can cost more than one request. Fetching after the filters keeps
+    // `--author @me --build` at one request per surviving row, not per row in
+    // the repository.
+    let want_build = args.build || args.build_status.is_some();
+    if want_build {
+        let ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+        let spinner = output::spinner("fetching build statuses");
+        let mut statuses = pr_build::statuses_for(&ctx.client, &ctx.slug, &ids).await?;
+        spinner.finish_and_clear();
+        for row in &mut rows {
+            let found = statuses.remove(&row.id).unwrap_or_default();
+            row.build_state = Some(BuildState::rollup(&found));
+            row.build = Some(found);
+        }
+        if let Some(wanted) = args.build_status {
+            rows.retain(|r| r.build_state == Some(wanted.as_state()));
+        }
+    }
+
+    render(ctx, &rows, want_build)
 }
 
-fn render(ctx: &Ctx, rows: &[PrRow]) -> Result<()> {
+fn build_cell(state: Option<BuildState>) -> String {
+    let state = state.unwrap_or(BuildState::None);
+    output::colored_cell(state.label(), output::tone_for(state))
+}
+
+fn render(ctx: &Ctx, rows: &[PrRow], build: bool) -> Result<()> {
     match ctx.format {
         Format::Json => output::print_json(&rows)?,
-        Format::Human => output::print_table(
-            &[
-                "ID",
-                "TITLE",
-                "STATE",
-                "SOURCE",
-                "→",
-                "TARGET",
-                "AUTHOR",
-                "REVIEWERS",
-            ],
-            rows.iter()
-                .map(|r| {
-                    vec![
-                        r.id.to_string(),
-                        r.title.clone(),
-                        r.display_state.clone(),
-                        r.source.clone(),
-                        "→".into(),
-                        r.destination.clone(),
-                        r.author.clone(),
-                        reviewer_cell(&r.reviewers),
-                    ]
-                })
-                .collect(),
-        ),
+        Format::Human => {
+            let mut headers: Vec<&str> = vec!["ID", "TITLE", "STATE"];
+            if build {
+                headers.push("BUILD");
+            }
+            headers.extend(["SOURCE", "→", "TARGET", "AUTHOR", "REVIEWERS"]);
+            output::print_table(
+                &headers,
+                rows.iter()
+                    .map(|r| {
+                        let mut cells =
+                            vec![r.id.to_string(), r.title.clone(), r.display_state.clone()];
+                        if build {
+                            cells.push(build_cell(r.build_state));
+                        }
+                        cells.extend([
+                            r.source.clone(),
+                            "→".into(),
+                            r.destination.clone(),
+                            r.author.clone(),
+                            reviewer_cell(&r.reviewers),
+                        ]);
+                        cells
+                    })
+                    .collect(),
+            )
+        }
     }
     Ok(())
 }

@@ -141,10 +141,16 @@ src/api/mod.rs         Client: auth header, pagination, error mapping
 src/api/models.rs      serde models, all Option-tolerant with documented fallbacks
 src/output.rs          Format, tables, color, spinners, relative_time
 src/users.rs           resolve a typed name to one Bitbucket user
+src/skill.rs           embedded SKILL.md, agent detection, install/status/uninstall state
 src/commands/*.rs      one module per command group
 src/commands/pr_list.rs       `pr list`: fetch, filter, render
 src/commands/pr_reviewers.rs  `pr reviewers` list/add/remove
+src/commands/skill.rs         `bb skill install/status/uninstall`
 ```
+
+**`bb skill *` deliberately bypasses `Ctx`.** It needs no `Client`, no `RepoSlug`, and no
+credentials — it only reads and writes local skill files, so it must keep working on a machine
+that has never run `bb auth login`. Do not thread it through `Ctx` as a drive-by refactor.
 
 **`Ctx` is the shared per-command context** and lives in `src/commands/pr.rs`:
 
@@ -183,6 +189,17 @@ merge. Three properties to preserve: the confirmation happens **before** the `PO
 not run under `--yes`, and the `inquire` prompt stays on stderr so `--json` stdout remains pure. The
 agent skill carries the matching rule — the agent never resolves on its own initiative — and must
 stay in step. `unresolve` is not gated: it restores a point rather than hides one.
+
+**The request-changes gate is deliberate too, and gates both directions.** `bb pr request-changes`
+and `bb pr no-request-changes` each confirm with a human unless `--yes` is passed, and error
+instead of prompting when there is no terminal. Unlike `resolve`/`unresolve`, where only hiding a
+point is gated, both directions are gated here: requesting changes and withdrawing that request are
+each a review verdict other people see, not a private housekeeping action like reopening a thread.
+The same three properties apply: the confirmation happens **before** the `POST`/`DELETE`
+(`tests/pr_review.rs` asserts this with `expect(0)`), the pull-request lookup that fills the prompt
+does not run under `--yes`, and the `inquire` prompt stays on stderr so `--json` stdout remains
+pure. The agent skill carries the matching rule — ask the user once, never mark uninvited, never
+approve — and must stay in step with this gate.
 
 **Use `Client::paginate`** rather than hand-rolling a page loop. It follows `next` and caps at 100 pages.
 
@@ -242,6 +259,23 @@ echoes a raw response body.
 - Assert on parsed JSON structure rather than substrings where practical.
 - Write tests that would actually fail if the behaviour regressed. A test that passes against the
   un-fixed code proves nothing.
+- `auto_refresh_skills` (`src/main.rs`) runs before every command's own logic, including in
+  integration tests that set `HOME`/`XDG_CONFIG_HOME` to a tempdir with tracked skills in it. A
+  test asserting on stderr can see its "refreshed N skill file(s) for bb …" line unless the
+  fixture has nothing tracked, or `BB_SKILL_NO_AUTO_REFRESH=1` is set.
+
+### Live smoke test
+
+The mocked suite proves the code calls an endpoint correctly, never that the endpoint still
+exists — wiremock serves whatever path is mounted, retired or not. That gap is exactly how
+`bb pr mine` shipped completely broken in v0.13.0: it called four endpoints Atlassian had already
+removed, and the wiremock suite stayed green the entire time. `tests/live.rs` closes it with a
+credential-gated, opt-in smoke test against the real API. Before releasing any change that adds or
+moves an API call, run it:
+
+```
+BB_LIVE_TEST=1 BB_WORKSPACE=<slug> cargo test --test live -- --ignored
+```
 
 ## Environment variables
 
@@ -249,9 +283,11 @@ echoes a raw response body.
 |---|---|
 | `BB_EMAIL`, `BB_TOKEN` | credentials for non-interactive/CI use, checked before the keyring |
 | `BB_REPO` | default repository, same as `-R/--repo` |
+| `BB_WORKSPACE` | default workspace(s) for `repo create`, `repo list`, `project list`, same as `--workspace` |
 | `BB_API_BASE` | override the API base URL (testing) |
 | `BB_UPDATE_API_BASE` | override the release-lookup API base URL for `bb update` (testing) |
 | `BB_KEYRING_DISABLE` | force keyring lookup failure (testing) |
+| `BB_SKILL_NO_AUTO_REFRESH` | disable the pre-command auto-refresh of tracked agent skill files |
 | `NO_COLOR` | disable color and spinners |
 
 ## Releasing

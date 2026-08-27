@@ -8,4 +8,6 @@ pub mod git;
 pub mod output;
 pub mod repo;
 pub mod secret;
+pub mod skill;
 pub mod users;
+pub mod workspace;

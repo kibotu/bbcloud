@@ -21,6 +21,7 @@ Do not use `gh`. Do not ask the user to open the web UI.
 5. Give a body to every comment. Use `--body` for one line. Use `--body-stdin` for more than one
    paragraph. Without a body and without a terminal, the command fails.
 6. Add `-R workspace/repo` to act on another repository. The default comes from the git remote.
+7. In a new checkout, run `bb skill install` to set up this skill. It needs no authentication.
 
 ## Read a pull request
 
@@ -29,14 +30,18 @@ bb pr list --json                          # open pull requests
 bb pr list main --state MERGED --json      # filter by target branch and state
 bb pr list --state all --json              # every state, not just OPEN
 bb pr list --needs-my-review --json        # I'm a reviewer and haven't approved yet
-bb pr list --reviewer patrick --json       # PRs that person is tagged on
+bb pr list --reviewer dana --json       # PRs that person is tagged on
 bb pr list --author @me --json             # PRs I opened; @me resolves the authenticated account
 bb pr list --review-state approved --json  # my own state: approved | changes-requested | pending
+bb pr list --build --json                  # add BUILD column: worst-wins rollup per PR
+bb pr list --build-status failed --json    # only PRs whose build rolls up to FAILED
 bb pr view 42 --json                       # the pull request, plus all comments
 bb pr view 42 --unresolved --json          # only the threads that still need an answer
 bb pr diff 42                              # raw diff, plain text
 bb pr files 42 --json                      # changed paths
 bb pr commits 42 --json                    # commits, short hashes
+bb pr mine --json                          # my PRs across every repo: authored + I review
+bb pr mine --role reviewer --build --json  # only ones waiting on me, with build state
 ```
 
 `bb pr view` returns `{ pull_request, general[], inline[] }`. Each comment has `id`, `author`,
@@ -53,6 +58,57 @@ Find the pull request for the current branch:
 ```bash
 bb pr list --json | jq --arg b "$(git branch --show-current)" '.[] | select(.source == $b)'
 ```
+
+## Build status
+
+```bash
+bb pr build 42 --json           # every check on one PR: key, name, state, url
+bb pr list --build --json       # a BUILD column across a list
+```
+
+States: `successful | failed | inprogress | stopped | none`. That vocabulary is
+`build_state`'s; `statuses[].state` and `build[].state` carry Bitbucket's raw
+uppercase value (`FAILED`, `INPROGRESS`, …). `none` means no check reported, or no
+check this version recognises — not that a check passed.
+
+`build_state` is a worst-wins rollup over every check on the pull request
+(`failed` > `stopped` > `inprogress` > `successful` > `none`), so asking "did anything
+fail" is one field read. `build[]` on a list row, and `statuses[]` on `bb pr build`,
+carry each individual check — read those to say *what* failed.
+
+`--build` costs one extra request per pull request, because Bitbucket exposes build
+status only per pull request. Combine it with a narrowing filter (`--author @me`,
+`--needs-my-review`, a target branch) rather than running it bare on a busy repository.
+Statuses are fetched only for pull requests that survive the other filters.
+
+## Across repositories
+
+`bb pr mine` is the only command that is not repository-scoped. There is no api call left that
+discovers which workspaces you belong to, so the workspace(s) to scan are resolved in this order:
+`--workspace <slug>[,<slug>...]` (comma-separated, highest precedence), then the `BB_WORKSPACE`
+env var (same syntax), then the workspace of the git remote in the current checkout — which is
+what makes a bare `bb pr mine` work inside a checkout. If none of the three apply, the command
+errors rather than silently scanning nothing.
+
+It returns `{ "pull_requests": [...], "partial": [...] }`. Each row carries `repo`
+(`workspace/repo`), `my_role` (`author` | `reviewer` | `both`), `my_review_state`, `updated_on`,
+and — with `--build` — `build_state` and `build[]`.
+
+`--role author` costs one request to find who you are, then one paginated call per workspace. The
+reviewer half costs one request to find who you are, one repository-listing call per workspace,
+then one call per scanned repository — for `--role all` both halves run, so it is one call to find
+who you are plus, per workspace, one authored call and one listing call followed by one call per
+scanned repository. A workspace the token cannot read is listed in `partial` rather than failing
+the command; say so when reporting from a partial scan.
+
+**The reviewer-side scan is a recency window, not full workspace coverage.** It covers only the
+`--repo-limit` most recently updated repositories per workspace (default 30) — on a workspace with
+hundreds of repositories, that is a small slice by design, not an oversight. Never report a
+`pr mine` brief as a complete picture of a workspace. If the user needs certainty about a specific
+repository, use `bb pr list -R <repo>` for that repository instead.
+
+For a ranked morning brief built on this command, the separate `bbc-daily-brief` skill carries the
+ranking rules. Use it only when the user explicitly asks for a brief.
 
 ## Answer a review
 
@@ -98,19 +154,52 @@ put it in a loop.
 Resolve the first comment of a thread — the id whose `parent` is `null`. A reply id fails, and a
 general comment fails: only inline threads carry a resolution.
 
-Ask the author to change the code, or withdraw that request:
+## Never create a repository on your own initiative
+
+`bb repo create` is a write to a shared workspace. Ask the human first, every time, and repeat
+back the workspace, the name and the project key you are about to use. A stray repository in a
+shared workspace is somebody's cleanup job.
+
+Never pass `--public`. The default is private; making a repository public is a decision for the
+human to state in words, and if they have not said "public" then they have not said it.
+
+If `--project` is unknown, run `bb project list` and ask which one — do not guess from the name.
+
+## Ask the author to change the code
+
+Marking a pull request as changes requested is a verdict on someone's work, so the user
+gives it, not you.
+
+After you post review comments that ask the author to change something, ask the user once
+whether to mark the pull request. On a yes, run it with `--yes`, because they just answered
+the question the prompt exists to ask:
 
 ```bash
-bb pr request-changes 42 --json
-bb pr no-request-changes 42 --json
+bb pr request-changes 42 --yes --json
+```
+
+Without `--yes` the command confirms with a human and fails when it has no terminal, so it
+cannot be marked by accident. Declining is an error, not a quiet success.
+
+Never mark changes requested on your own initiative, and never on a pull request you did not
+just review.
+
+**Never approve a pull request.** No command does it and there is no substitute to reach for.
+Approval is a human action, like merging.
+
+Withdraw a change request only after a re-review finds the earlier points addressed — offer
+it, ask first, and never do it to clear the way for a merge:
+
+```bash
+bb pr no-request-changes 42 --yes --json
 ```
 
 ## Reviewers
 
 ```bash
 bb pr reviewers 42 --json                     # list, same as `list`
-bb pr reviewers add 42 patrick,raigon --json  # tag reviewers, comma-separated
-bb pr reviewers remove 42 raigon --json       # untag a reviewer
+bb pr reviewers add 42 dana,ash --json  # tag reviewers, comma-separated
+bb pr reviewers remove 42 ash --json       # untag a reviewer
 ```
 
 Names match case-insensitively as a substring of display name or nickname, against the
@@ -140,6 +229,10 @@ The source branch defaults to the current checkout. The title defaults to
 you from that list. Pass `--no-default-reviewers` to attach none. Do not pass `-i`, because it
 prompts.
 
+For the full workflow — suggesting reviewers from the history of the files you changed, and
+writing a description a human can skim — use the `bbc-open-pr` skill. It is installed by
+`bb skill install`.
+
 ## Branches
 
 ```bash
@@ -154,20 +247,25 @@ Both filters match a substring, and ignore case.
 
 | Command | Result |
 |---|---|
-| `bb pr list [target] [--state OPEN\|MERGED\|DECLINED\|SUPERSEDED\|DRAFT\|ALL] [--reviewer] [--author] [--review-state] [--needs-my-review]` | `[{id,title,state,draft,author,source,destination,reviewers[],url}]` |
+| `bb pr list [target] [--state OPEN\|MERGED\|DECLINED\|SUPERSEDED\|DRAFT\|ALL] [--reviewer] [--author] [--review-state] [--needs-my-review] [--build] [--build-status <state>]` | `[{id,title,state,draft,author,source,destination,reviewers[],url}]`, plus `build_state` and `build[{key,name,state,url}]` when `--build` or `--build-status` is given |
 | `bb pr view <id> [--unresolved] [--comments-only]` | `{pull_request,general[],inline[]}` |
 | `bb pr diff <id>` | plain diff; `--json` wraps it as `{id,diff}` |
 | `bb pr files <id>` | `[{status,path}]` |
 | `bb pr commits <id>` | `[{hash,summary}]` |
+| `bb pr build <id>` | `{build_state,statuses[{key,name,state,url}]}` |
+| `bb pr mine [--role author\|reviewer\|all] [--state] [--workspace] [--repo-limit] [--build]` | `{pull_requests[{repo,id,title,url,state,draft,author,my_role,my_review_state,reviewers[],updated_on}],partial[]}` |
 | `bb pr comment <id> …` | `{id,pull_request,url}` |
 | `bb pr resolve <id> <comment> --yes` | `{resolved,pull_request}`; only on the user's request |
 | `bb pr unresolve <id> <comment>` | `{unresolved,pull_request}` |
 | `bb pr reviewers <id>` / `list <id>` | `[{name,uuid,state}]` |
 | `bb pr reviewers add <id> <names>` / `remove <id> <names>` | `[{name,uuid,state}]` |
 | `bb pr create <target> [source] …` | `[{id,target,url}]` |
-| `bb pr request-changes <id>` | `{requested_changes:<id>}` |
-| `bb pr no-request-changes <id>` | `{unrequested_changes:<id>}` |
+| `bb pr request-changes <id> --yes` | `{requested_changes:<id>}`; only on the user's request |
+| `bb pr no-request-changes <id> --yes` | `{unrequested_changes:<id>}`; only on the user's request |
 | `bb branch list …` | `[{branch,user,updated}]` |
+| `bb project list` | the projects in a workspace |
+| `bb repo list [--project KEY]` | the repositories in a workspace or project |
+| `bb repo create <name> --project KEY` | create a repository, private by default |
 | `bb auth status` | `{email,token,account}`, token redacted |
 | `bb browse --print [--pr <id>\|--branches]` | `{url}` |
 
